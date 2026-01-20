@@ -119,6 +119,50 @@ const hasTimeConflict = (
   });
 };
 
+const inferRepeatOption = (current: Reservation, all: Reservation[]) => {
+  const baseStart = new Date(current.start_time);
+  const baseTimeKey = `${baseStart.getHours()}:${baseStart.getMinutes()}`;
+
+  const sameSeries = all.filter((r) => {
+    if (r.id === current.id) return true; // 현재 포함
+    if (r.room_id !== current.room_id) return false;
+    if (r.title !== current.title) return false;
+    if (r.reserver_name !== current.reserver_name) return false;
+    if (r.reserver_team !== current.reserver_team) return false;
+
+    const s = new Date(r.start_time);
+    const timeKey = `${s.getHours()}:${s.getMinutes()}`;
+    return timeKey === baseTimeKey;
+  });
+
+  if (sameSeries.length <= 1) {
+    return { option: 'none' as const, endDate: baseStart.toISOString().slice(0, 10) };
+  }
+
+  const dates = sameSeries
+    .map((r) => {
+      const d = new Date(r.start_time);
+      return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    })
+    .sort((a, b) => a.getTime() - b.getTime());
+
+  const diffs = [];
+  for (let i = 1; i < dates.length; i++) {
+    diffs.push((dates[i].getTime() - dates[i - 1].getTime()) / 86400000);
+  }
+
+  const allDaily = diffs.every((d) => d === 1);
+  const allWeekly = diffs.every((d) => d === 7);
+
+  const endDate = dates[dates.length - 1].toISOString().slice(0, 10);
+
+  if (allDaily) return { option: 'daily' as const, endDate };
+  if (allWeekly) return { option: 'weekly' as const, endDate };
+  return { option: 'none' as const, endDate: baseStart.toISOString().slice(0, 10) };
+};
+
+
+
   /* 이번 주 월~금 */
   const weekdays = Array.from({ length: 5 }, (_, i) => {
     const d = new Date(monday);
@@ -148,6 +192,45 @@ const hasTimeConflict = (
 
     /* 전체 예약 불러오기 */
 const [reservations, setReservations] = useState<Reservation[]>([]);
+
+// ✅ 같은 반복 시리즈(묶음) 찾기: 같은 회의실/제목/예약자/팀/시작시간(시:분)
+const getSameSeries = (current: Reservation, all: Reservation[]) => {
+  const baseStart = new Date(current.start_time);
+  const baseTimeKey = `${baseStart.getHours()}:${baseStart.getMinutes()}`;
+
+  return all.filter((r) => {
+    if (r.room_id !== current.room_id) return false;
+    if (r.title !== current.title) return false;
+    if (r.reserver_name !== current.reserver_name) return false;
+    if (r.reserver_team !== current.reserver_team) return false;
+
+    const s = new Date(r.start_time);
+    const timeKey = `${s.getHours()}:${s.getMinutes()}`;
+    return timeKey === baseTimeKey;
+  });
+};
+
+// ✅ 특정 예약 id 목록(excludeIds)을 제외하고 시간 겹침(중복) 체크
+const hasTimeConflictExcludeIds = (
+  all: Reservation[],
+  roomId: number,
+  startISO: string,
+  endISO: string,
+  excludeIds: number[],
+) => {
+  const newStart = new Date(startISO).getTime();
+  const newEnd = new Date(endISO).getTime();
+
+  return all.some((r) => {
+    if (r.room_id !== roomId) return false;
+    if (excludeIds.includes(r.id)) return false;
+
+    const s = new Date(r.start_time).getTime();
+    const e = new Date(r.end_time).getTime();
+    return e > newStart && s < newEnd;
+  });
+};
+
 
 const loadReservations = async () => {
   const { data, error } = await supabase
@@ -1206,8 +1289,15 @@ const getRepeatDisplay = (
                 >
                   <button
                     onClick={() => {
-                      setModalMode('edit');
-                    }}
+                    // ✅ 현재 예약이 반복인지 추정해서 edit 폼에 세팅
+                    const inferred = inferRepeatOption(selectedReservation, reservations); // 아래 함수 추가
+                    setRepeatOption(inferred.option);
+                    setModalEndDate(inferred.endDate); // YYYY-MM-DD
+                    setModalMode('edit');
+                    setModalStartDate(selectedReservation.start_time.slice(0, 10));
+
+                  }}
+
                     style={{
                       flex: 1,
                       padding: '8px',
@@ -1508,49 +1598,101 @@ const getRepeatDisplay = (
     }
 
 
-    // 2️⃣ 수정 모드 (단일 날짜만)
     if (modalMode === 'edit' && selectedReservation) {
-      const dateStr = startDateObj.toISOString().slice(0, 10);
-      const startISO = `${dateStr}T${modalStart}:00+09:00`;
-      const endISO = `${dateStr}T${modalEnd}:00+09:00`;
+  const dateStr = startDateObj.toISOString().slice(0, 10);
+  const startISO = `${dateStr}T${modalStart}:00+09:00`;
+  const endISO = `${dateStr}T${modalEnd}:00+09:00`;
 
-      // 🔍 중복 체크 (자기 자신은 제외)
-      if (
-        hasTimeConflict(
-          modalRoom.id,
-          startISO,
-          endISO,
-          selectedReservation.id, // 제외할 예약 id
-        )
-      ) {
-        alert(
-          '이미 해당 시간에 이 회의실에 예약이 있습니다. 다른 시간대를 선택해주세요.',
-        );
-        return;
-      }
-
-      const { error } = await supabase
-        .from('reservations')
-        .update({
-          room_id: modalRoom.id,
-          title: modalTitle,
-          reserver_name: modalName,
-          reserver_team: modalTeam,
-          start_time: startISO,
-          end_time: endISO,
-        })
-        .eq('id', selectedReservation.id);
-
-      if (error) {
-        alert('예약 변경 실패: ' + error.message);
-      } else {
-        alert('예약이 변경되었습니다.');
-        setIsModalOpen(false);
-        resetModalFields();
-        await loadReservations(); // ⬅️ 인자 없이!
-      }
+  // ✅ 반복이 '없음'이면 기존처럼 1건 업데이트
+  if (repeatOption === 'none') {
+    if (hasTimeConflict(modalRoom.id, startISO, endISO, selectedReservation.id)) {
+      alert('이미 해당 시간에 이 회의실에 예약이 있습니다. 다른 시간대를 선택해주세요.');
       return;
     }
+
+    const { error } = await supabase
+      .from('reservations')
+      .update({
+        room_id: modalRoom.id,
+        title: modalTitle,
+        reserver_name: modalName,
+        reserver_team: modalTeam,
+        start_time: startISO,
+        end_time: endISO,
+      })
+      .eq('id', selectedReservation.id);
+
+    if (error) alert('예약 변경 실패: ' + error.message);
+    else {
+      alert('예약이 변경되었습니다.');
+      setIsModalOpen(false);
+      resetModalFields();
+      await loadReservations();
+    }
+    return;
+  }
+
+  // ✅ 반복이면: "시리즈"를 찾아 삭제 후 재생성
+  const series = getSameSeries(selectedReservation, reservations); // 아래 함수 추가
+  const seriesIds = series.map((r) => r.id);
+
+  // 1) 새 규칙의 날짜 목록 만들기 (create 로직 재사용)
+  const dates: string[] = [];
+  const cursor = new Date(startDateObj);
+  while (cursor <= endDateObj) {
+    dates.push(cursor.toISOString().slice(0, 10));
+    cursor.setDate(cursor.getDate() + (repeatOption === 'daily' ? 1 : 7));
+  }
+
+  // 2) 새로 만들 records와 중복 체크(기존 시리즈는 제외해야 하므로 exclude ids 반영 필요)
+  for (const d of dates) {
+    const sISO = `${d}T${modalStart}:00+09:00`;
+    const eISO = `${d}T${modalEnd}:00+09:00`;
+
+    // hasTimeConflict는 "특정 id 하나만 exclude"라서,
+    // 시리즈 전체 제외 버전이 필요함 → 아래 함수로 해결
+    if (hasTimeConflictExcludeIds(reservations, modalRoom.id, sISO, eISO, seriesIds)) {
+
+      alert(`${d} ${modalStart}~${modalEnd} 에 이미 예약이 있습니다. 다른 시간대를 선택해주세요.`);
+      return;
+    }
+  }
+
+  // 3) 기존 시리즈 삭제
+  const { error: delErr } = await supabase
+    .from('reservations')
+    .delete()
+    .in('id', seriesIds);
+
+  if (delErr) {
+    alert('기존 반복 예약 삭제 실패: ' + delErr.message);
+    return;
+  }
+
+  // 4) 새 시리즈 insert
+  const records = dates.map((d) => ({
+    room_id: modalRoom.id,
+    title: modalTitle,
+    reserver_name: modalName,
+    reserver_team: modalTeam,
+    start_time: `${d}T${modalStart}:00+09:00`,
+    end_time: `${d}T${modalEnd}:00+09:00`,
+    created_by: 'manual',
+  }));
+
+  const { error: insErr } = await supabase.from('reservations').insert(records);
+
+  if (insErr) {
+    alert('반복 예약 변경 실패: ' + insErr.message);
+  } else {
+    alert('반복 예약이 변경되었습니다.');
+    setIsModalOpen(false);
+    resetModalFields();
+    await loadReservations();
+  }
+  return;
+}
+
 
     // 3️⃣ 생성 모드 (반복 포함)
     const dates: string[] = [];
